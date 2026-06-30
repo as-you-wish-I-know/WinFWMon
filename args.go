@@ -21,6 +21,8 @@ type cliArgs struct {
 	debug      bool
 	history    bool   // --history: ingest existing events only; no auditing, no polling
 	configPath string // --config=<path>: override the config file location ("" = default)
+	forcePowerShell bool // --powershell: use the PowerShell poll source, skip EvtSubscribe
+	noFallback      bool // --no-fallback: if EvtSubscribe fails, error and exit (no fallback)
 }
 
 // parseAndDispatchArgs parses os.Args. If a headless command is present it runs
@@ -41,6 +43,12 @@ func parseAndDispatchArgs(argv []string) (args cliArgs, exitNow bool, code int) 
 
 		case lower == "--history" || lower == "/history":
 			args.history = true
+
+		case lower == "--powershell" || lower == "/powershell":
+			args.forcePowerShell = true
+
+		case lower == "--no-fallback" || lower == "/no-fallback":
+			args.noFallback = true
 
 		case lower == "--help" || lower == "-h" || lower == "/help" || lower == "/?":
 			attachParentConsole()
@@ -91,6 +99,18 @@ func parseAndDispatchArgs(argv []string) (args cliArgs, exitNow bool, code int) 
 			// Non-switch bare argument: ignore (no positional args are defined).
 		}
 	}
+
+	// --powershell and --no-fallback are contradictory: --no-fallback governs
+	// what happens when the EvtSubscribe attempt fails, but --powershell skips
+	// that attempt entirely. Passing both is a user error.
+	if args.forcePowerShell && args.noFallback {
+		attachParentConsole()
+		consoleErr("WinFWMon: --powershell and --no-fallback cannot be used together.")
+		consoleErr("  --powershell skips EvtSubscribe; --no-fallback only affects EvtSubscribe failure.")
+		consoleErr("Run WinFWMon --help for usage.")
+		return args, true, finishHeadless(2)
+	}
+
 	return args, false, 0
 }
 
@@ -116,6 +136,11 @@ func printHelp() {
 	consoleOut("  --history            Show only events already in the Security log; do not")
 	consoleOut("                       enable WFP auditing or poll for new events. The Start")
 	consoleOut("                       button is disabled in this mode.")
+	consoleOut("  --powershell         Use the PowerShell (Get-WinEvent) polling event source")
+	consoleOut("                       instead of the default low-latency EvtSubscribe source.")
+	consoleOut("  --no-fallback        If the EvtSubscribe source fails to start, exit with an")
+	consoleOut("                       error instead of falling back to PowerShell polling.")
+	consoleOut("                       (Cannot be combined with --powershell.)")
 	consoleOut("  --wfp                Print the current WFP connection-auditing status and exit.")
 	consoleOut("  --wfp=on             Turn WFP connection auditing on and exit (needs Administrator).")
 	consoleOut("  --wfp=off            Turn WFP connection auditing off and exit (needs Administrator).")

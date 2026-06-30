@@ -1,6 +1,6 @@
 # WinFWMon
 
-**Version 1.0**
+**Version 2.0**
 
 A native Windows 11 application that watches Windows Filtering Platform (WFP)
 connection events in real time, displays allowed and blocked connections
@@ -9,7 +9,7 @@ decision.
 
 ## Features
 
-- **Live event stream** — new connection events appear automatically; pause/resume at any time
+- **Live event stream** — new connection events appear automatically; pause/resume at any time. By default events arrive via a low-latency **EvtSubscribe** push subscription (typically sub-second); if that cannot start, the app automatically falls back to **PowerShell** polling and notes this in the status bar. The status bar always shows the active source and whether it is Running or Stopped (or History mode).
 - **Color-coded rows** — green for ALLOW (5156), red for DROP (5157)
 - **Two-level rule attribution**:
   - **Matched Rule** — the recognizable Windows Defender Firewall rule, found by
@@ -50,7 +50,6 @@ decision.
 - **Help → About the Windows Security Log...** explains what the Windows
   Security log is, how WinFWMon uses it to read firewall events, how the log can
   be cleared, and the consequences of clearing it.
-- **Reload Rules** button refreshes the WFP filter table and firewall rules
 - **Preferences menu** — Columns…, Noise Filter…, Event Window…, and Time Display…
   live under the Preferences menu
 - **Reload Rules** button — located beside the Start/Stop button; refreshes the
@@ -97,6 +96,12 @@ their output there, and exit without opening a window.
 - `--history` — show only events already in the Security log; do not enable WFP
   auditing or poll for new events. The Start button is disabled in this mode.
   Growing the event window in this mode re-reads a deeper backlog.
+- `--powershell` — use the PowerShell (`Get-WinEvent`) polling event source
+  instead of the default low-latency EvtSubscribe source. Applies to both live
+  monitoring and the history-mode backlog read.
+- `--no-fallback` — if the EvtSubscribe source fails to start, exit with an error
+  instead of falling back to PowerShell polling. Cannot be combined with
+  `--powershell` (doing so is reported as an error and the app exits).
 - `--wfp` — print the current WFP connection-auditing status and exit.
 - `--wfp=on` / `--wfp=off` — turn WFP connection auditing on/off and exit.
   Requires an elevated (Administrator) console; returns a non-zero exit code if
@@ -148,6 +153,25 @@ This is precise attribution: it reports the filter that actually handled the
 packet, rather than guessing from direction/protocol/port as a text-log reader
 must.
 
+### Event sources
+
+For **live monitoring**, WinFWMon subscribes to the Security log through the
+Windows Event Log API (`EvtSubscribe`), which pushes 5156/5157 events as they
+are written — typically surfacing them in well under a second. If the
+subscription cannot start, the app automatically falls back to **PowerShell**
+(`Get-WinEvent`) polling and notes this in the status bar. The `--powershell`
+switch forces the polling source from the start; `--no-fallback` makes an
+EvtSubscribe failure fatal instead of falling back.
+
+For **history mode** (`--history`), the existing backlog is read through the
+companion `EvtQuery` API, which is dramatically faster than the previous
+PowerShell approach — tens of thousands of events load near-instantly. (Under
+`--powershell`, history uses the slower PowerShell backlog read instead.)
+
+Both sources produce identical event records and feed the same downstream
+rule-attribution and display logic, so the active source does not change how any
+event appears.
+
 ### WFP connection auditing
 
 Events 5156/5157 are only recorded when the **"Filtering Platform Connection"**
@@ -181,6 +205,7 @@ present in the Security log and cannot enable auditing.
 
 | Field | Notes |
 |-------|-------|
+| IP version | IPv4 only / IPv6 only / all |
 | Protocol | TCP, UDP, ICMP, ICMPv6, or blank for all |
 | Src/Dst IP | Substring match — enter `192.168` to match any 192.168.x.x address; wrap in quotes for an exact match (`"192.168.1.1"`) |
 | Src/Dst Port | Substring match against the port number — `80` matches 80, 800, and 8080; wrap in quotes for an exact match (`"80"` matches only 80) |
@@ -208,6 +233,7 @@ WinFWMon/
 ├── console.go       — Parent-console attach + output for headless modes
 ├── config.go        — Settings persistence (WinFWMon.json) and --config handling
 ├── eventlog.go      — Security-log event source (Get-WinEvent 5156/5157)
+├── evtsubscribe.go  — Low-latency EvtSubscribe push event source (wevtapi)
 ├── wfpfilters.go    — WFP filter table (netsh wfp show filters) and ID→name resolution
 ├── rules.go         — Defender firewall rule matcher (attribute-based attribution)
 ├── parser.go        — Shared LogEntry event record type
@@ -218,8 +244,36 @@ WinFWMon/
 ├── syscall_windows.go — Windows process attribute helper
 ├── winfwmon.manifest — DPI and common-controls manifest
 ├── go.mod
-└── build.bat
+├── build.bat
+└── testing/
+    └── generate_traffic.ps1 — optional helper to generate steady firewall events
 ```
+
+---
+
+## Testing
+
+The `testing/` folder contains an optional helper for exercising the monitor:
+
+**`generate_traffic.ps1`** — produces a steady, dense stream of outbound firewall
+events so you can watch WinFWMon surface live connections without waiting for
+incidental network activity. It opens short-lived TCP connections (to Google
+public DNS, `8.8.8.8:53`, by default) a few times per second. TCP connections
+are logged far more reliably as 5156 events than ICMP echoes (ping), which
+Windows under-logs, which is why this uses TCP rather than a simple ping loop.
+
+Run it in a separate elevated PowerShell window while WinFWMon is monitoring:
+
+```
+powershell -ExecutionPolicy Bypass -File testing\generate_traffic.ps1
+```
+
+Stop it with Ctrl+C when finished. The script makes real outbound connection
+attempts but sends no data; if you prefer to avoid sustained external
+connections, edit the `$target` variable to point at a LAN address (such as your
+router) — the firewall event fires on the local connection attempt regardless of
+the destination. The connection rate is set by `$perSecond` near the top of the
+script.
 
 ---
 

@@ -1,0 +1,101 @@
+{
+  "hideNoise": true,
+  "collapseDuplicates": true,
+  "onlyAfterLaunch": true,
+  "liveTail": true,
+  "hideNoMatch": false,
+  "highlightICMP": true,
+  "hideLoopback": true,
+  "windowSize": 2000,
+  "timePrecision": "seconds",
+  "timeZone": "local",
+  "columns": [
+    {
+      "title": "Date",
+      "visible": false,
+      "width": 90
+    },
+    {
+      "title": "Time",
+      "visible": true,
+      "width": 95
+    },
+    {
+      "title": "Action",
+      "visible": true,
+      "width": 60
+    },
+    {
+      "title": "Count",
+      "visible": false,
+      "width": 55
+    },
+    {
+      "title": "Direction",
+      "visible": true,
+      "width": 80
+    },
+    {
+      "title": "Protocol",
+      "visible": true,
+      "width": 65
+    },
+    {
+      "title": "Source IP",
+      "visible": true,
+      "width": 130
+    },
+    {
+      "title": "Src Port",
+      "visible": true,
+      "width": 65
+    },
+    {
+      "title": "Dest IP",
+      "visible": true,
+      "width": 130
+    },
+    {
+      "title": "Dst Port",
+      "visible": true,
+      "width": 65
+    },
+    {
+      "title": "PID",
+      "visible": true,
+      "width": 60
+    },
+    {
+      "title": "Process",
+      "visible": true,
+      "width": 140
+    },
+    {
+      "title": "Matched Rule",
+      "visible": true,
+      "width": 300
+    },
+    {
+      "title": "WFP Filter",
+      "visible": false,
+      "width": 220
+    }
+  ],
+  "columnOrder": [
+    "Time",
+    "Action",
+    "Direction",
+    "Protocol",
+    "Source IP",
+    "Src Port",
+    "Dest IP",
+    "Dst Port",
+    "PID",
+    "Process",
+    "Matched Rule",
+    "Date",
+    "Count",
+    "WFP Filter"
+  ],
+  "filters": {}
+}

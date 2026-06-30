@@ -27,7 +27,7 @@ import (
 // version shown in the window title and About dialog.
 const (
 	appName    = "WinFWMon"
-	appVersion = "1.0"
+	appVersion = "2.0"
 )
 
 // Window-size bounds. The "event window" is the maximum number of events held
@@ -468,7 +468,7 @@ func (m *entryModel) visibleSnapshot() []*LogEntry {
 //   - pumpStop is closed by the UI goroutine on exit to terminate uiPump.
 type appState struct {
 	model            *entryModel
-	eventSource      *EventSource
+	eventSource      eventStopper
 	entryChan        chan *LogEntry
 	pumpStop         chan struct{} // closed to terminate uiPump goroutine
 	pumpStopOnce     sync.Once     // guards the close of pumpStop
@@ -492,6 +492,15 @@ type appState struct {
 	historyMode      bool         // --history: show existing events only, no auditing/polling
 	configOverride   string       // --config=<path>: non-default config location ("" = default)
 
+	// Event-source selection (set at startup from CLI switches; the chosen path
+	// is fixed for the session — no mid-run switching).
+	forcePowerShell    bool   // --powershell: poll from the start, skip EvtSubscribe
+	noFallback         bool   // --no-fallback: if EvtSubscribe fails, error and exit
+	activeSourceKind   string // "EvtSubscribe" | "PowerShell" | "" (none yet)
+	sourceRunning      bool   // whether the active source is currently running
+	evtSubscribeFailed string // non-empty if EvtSubscribe failed and we fell back (reason)
+	statusRevertGen    uint64 // bumped whenever a transient status is shown; a scheduled revert only fires if still current
+
 	totalCount int
 	mu         sync.Mutex
 
@@ -499,6 +508,7 @@ type appState struct {
 	mw                 *walk.MainWindow
 	table              *walk.TableView
 	statusBar          *walk.StatusBarItem
+	sourceBar          *walk.StatusBarItem
 	countBar           *walk.StatusBarItem
 	pauseBtn           *walk.PushButton
 	filterProto        *walk.LineEdit
@@ -531,8 +541,32 @@ type appState struct {
 
 var app = &appState{}
 
-// setStatus updates the status bar text. Nil-safe for the pre-realisation window.
+// setStatusTransient shows a temporary status message, then reverts to the
+// normal program-state status (readingStatus) after delay. Any later setStatus
+// call (transient or not) cancels a pending revert via the generation counter,
+// so the revert never clobbers a more recent, more important message.
+// Must be called on the UI goroutine.
+func setStatusTransient(text string, delay time.Duration) {
+	setStatus(text)        // bumps statusRevertGen
+	gen := app.statusRevertGen
+	go func() {
+		time.Sleep(delay)
+		if app.mw == nil {
+			return
+		}
+		app.mw.Synchronize(func() {
+			if app.statusRevertGen == gen {
+				setStatus(readingStatus())
+			}
+		})
+	}()
+}
+
+// setStatus updates the status bar text. Nil-safe for the pre-realisation
+// window. Every call bumps statusRevertGen so any scheduled transient revert
+// that is no longer current quietly cancels itself.
 func setStatus(text string) {
+	app.statusRevertGen++
 	if app.statusBar != nil {
 		app.statusBar.SetText(text)
 	}
@@ -543,6 +577,36 @@ func setCount(text string) {
 	if app.countBar != nil {
 		app.countBar.SetText(text)
 	}
+}
+
+// updateSourceStatus refreshes the source/state status bar item to clearly
+// indicate what the app is doing: the active event source and whether it is
+// running or stopped, History mode, or none. Nil-safe before realisation.
+func updateSourceStatus() {
+	if app.sourceBar == nil {
+		return
+	}
+	var text string
+	switch {
+	case app.historyMode:
+		if app.forcePowerShell {
+			text = "History mode (snapshot, PowerShell)"
+		} else {
+			text = "History mode (snapshot, EvtQuery)"
+		}
+	case app.activeSourceKind == "":
+		text = "Source: none"
+	default:
+		state := "Stopped"
+		if app.sourceRunning {
+			state = "Running"
+		}
+		text = fmt.Sprintf("%s: %s", app.activeSourceKind, state)
+		if app.activeSourceKind == "PowerShell" && app.evtSubscribeFailed != "" {
+			text += " (EvtSubscribe failed; fell back)"
+		}
+	}
+	app.sourceBar.SetText(text)
 }
 
 func main() {
@@ -556,6 +620,8 @@ func main() {
 		enableDebugLogging()
 	}
 	app.historyMode = cli.history
+	app.forcePowerShell = cli.forcePowerShell
+	app.noFallback = cli.noFallback
 	app.configOverride = cli.configPath
 
 	defer func() {
@@ -692,6 +758,7 @@ func buildUI() error {
 		reloadAction       *walk.Action
 		table              *walk.TableView
 		statusItem         *walk.StatusBarItem
+		sourceItem         *walk.StatusBarItem
 		countItem          *walk.StatusBarItem
 		mw                 *walk.MainWindow
 	)
@@ -1019,7 +1086,8 @@ func buildUI() error {
 		},
 
 		StatusBarItems: []StatusBarItem{
-			{AssignTo: &statusItem, Text: "Initializing...", Width: 500},
+			{AssignTo: &statusItem, Text: "Initializing...", Width: 400},
+			{AssignTo: &sourceItem, Text: "Source: -", Width: 220},
 			{AssignTo: &countItem, Text: "0 events", Width: 120},
 		},
 	}.Create()
@@ -1031,6 +1099,7 @@ func buildUI() error {
 	app.mw = mw
 	app.table = table
 	app.statusBar = statusItem
+	app.sourceBar = sourceItem
 	app.countBar = countItem
 	app.pauseBtn = pauseBtn
 	app.startStopBtn = startStopBtn
@@ -1183,6 +1252,7 @@ func checkAndPromptLogging() {
 	// disabled (set up in buildUI), so the user cannot begin live monitoring.
 	if app.historyMode {
 		setStatus(fmt.Sprintf("History mode - reading up to %d events...", effectiveWindowSize()))
+		updateSourceStatus()
 		dbg("checkAndPromptLogging: history mode, one-shot backlog ingest")
 		startHistoryIngest()
 		return
@@ -1612,7 +1682,7 @@ func reloadRuleData() {
 			case rerr != nil:
 				setStatus("Rule reload failed: " + rerr.Error())
 			default:
-				setStatus("WFP filters and firewall rules reloaded")
+				setStatusTransient("WFP filters and firewall rules reloaded", 5*time.Second)
 			}
 		})
 	}()
@@ -1915,13 +1985,77 @@ func setStatusWindowSize(n int) {
 	}
 }
 
+// eventStopper is the minimal contract the UI needs to control whichever event
+// source is active. Both the PowerShell EventSource and the evtSubscribeSource
+// satisfy it. (Starting differs — EvtSubscribe can fail and trigger fallback —
+// so starting is handled in startEventSource, not via this interface.)
+type eventStopper interface {
+	Stop()
+}
+
+// startEventSource selects and starts the live event source per the startup
+// switches, EvtSubscribe preferred with PowerShell as fallback. The choice is
+// made once and fixed for the session; there is no mid-run switching.
+//
+//	default        : try EvtSubscribe; on failure, fall back to PowerShell
+//	--powershell   : use PowerShell from the start (skip EvtSubscribe)
+//	--no-fallback  : try EvtSubscribe; on failure, error and exit (no fallback)
+//	(both)         : rejected at CLI parse time (see args.go)
 func startEventSource() {
 	dbg("startEventSource: starting")
 	if app.eventSource != nil {
 		app.eventSource.Stop()
+		app.eventSource = nil
 	}
-	app.eventSource = newEventSource(app.entryChan)
-	app.eventSource.Start()
+
+	if app.forcePowerShell {
+		dbg("startEventSource: --powershell, using poll source")
+		startPowerShellSource()
+		return
+	}
+
+	sub := newEvtSubscribeSource(app.entryChan)
+	if err := sub.Start(); err != nil {
+		dbg("startEventSource: EvtSubscribe failed: %v", err)
+		if app.noFallback {
+			fatalEventSourceError(fmt.Sprintf(
+				"EvtSubscribe could not start and --no-fallback was specified:\n%v", err))
+			return
+		}
+		dbg("startEventSource: falling back to PowerShell poll source")
+		app.evtSubscribeFailed = err.Error()
+		startPowerShellSource()
+		return
+	}
+
+	app.eventSource = sub
+	app.activeSourceKind = "EvtSubscribe"
+	app.evtSubscribeFailed = "" // clear any stale note from a previous fallback
+	app.sourceRunning = true
+	updateSourceStatus()
+}
+
+// startPowerShellSource starts the polling event source and records it active.
+func startPowerShellSource() {
+	src := newEventSource(app.entryChan)
+	src.Start()
+	app.eventSource = src
+	app.activeSourceKind = "PowerShell"
+	app.sourceRunning = true
+	updateSourceStatus()
+}
+
+// fatalEventSourceError reports a fatal source-startup error and terminates.
+// Used only for --no-fallback when EvtSubscribe fails.
+func fatalEventSourceError(msg string) {
+	dbg("fatalEventSourceError: %s", msg)
+	app.activeSourceKind = ""
+	app.sourceRunning = false
+	if app.mw != nil {
+		walk.MsgBox(app.mw, "Event source error", msg,
+			walk.MsgBoxIconError|walk.MsgBoxOK)
+		app.mw.Close()
+	}
 }
 
 // effectiveWindowSize returns the configured maximum number of events to retain
@@ -1942,26 +2076,90 @@ func effectiveWindowSize() int {
 }
 
 // startHistoryIngest performs a one-shot backlog read for --history mode: it
-// pulls up to the window size of existing events, then stops. No auditing is
-// changed and no recurring polling is started.
+// pulls up to the window size of the most recent existing events, then stops.
+// No auditing is changed and no recurring polling is started.
+//
+// By default it uses the fast native EvtQuery reader. If --powershell was given,
+// it honors that and uses the PowerShell (Get-WinEvent) backlog read instead,
+// matching the live source-selection behavior so the switch is consistent
+// across modes.
 func startHistoryIngest() {
 	if app.eventSource != nil {
 		app.eventSource.Stop()
 	}
-	src := newEventSource(app.entryChan)
-	src.backlog = effectiveWindowSize()
-	app.eventSource = src
-	go src.RunOnce(func(count int) {
-		// Report the true number of events read from the log. Marshalled to the
-		// UI goroutine because setStatus touches a walk control. The events may
-		// still be rendering (they flow through uiPump in batches), but "read"
-		// refers to ingestion from the Security log, which is complete here.
+
+	// Shared completion handler: report the true number of events read.
+	done := func(count int) {
 		if app.mw != nil {
 			app.mw.Synchronize(func() {
 				setStatus(fmt.Sprintf("History mode - successfully read %d events", count))
 			})
 		}
-	})
+	}
+
+	if app.forcePowerShell {
+		dbg("startHistoryIngest: --powershell, using PowerShell backlog read")
+		src := newEventSource(app.entryChan)
+		src.backlog = effectiveWindowSize()
+		app.eventSource = src
+		go src.RunOnce(done)
+		return
+	}
+
+	src := newHistoryBacklogSource(app.entryChan, effectiveWindowSize())
+	app.eventSource = src
+	src.Start(done)
+}
+
+// historyBacklogSource reads a bounded backlog once via EvtQuery and feeds the
+// entries to the shared channel, then completes. It satisfies eventStopper so
+// the UI controls and shuts it down like any other source.
+type historyBacklogSource struct {
+	out      chan *LogEntry
+	max      int
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
+}
+
+func newHistoryBacklogSource(out chan *LogEntry, max int) *historyBacklogSource {
+	return &historyBacklogSource{
+		out:    out,
+		max:    max,
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+}
+
+// Start launches the one-shot backlog read on its own goroutine. done (optional)
+// is called with the number of entries sent, on completion (not if aborted by
+// Stop). Mirrors the old EventSource.RunOnce contract.
+func (h *historyBacklogSource) Start(done func(count int)) {
+	go func() {
+		defer close(h.doneCh)
+		entries, err := readBacklogViaEvtQuery(h.max, h.stopCh)
+		if err != nil {
+			dbg("historyBacklogSource: %v", err)
+		}
+		sent := 0
+		for _, e := range entries {
+			select {
+			case h.out <- e:
+				sent++
+			case <-h.stopCh:
+				return // aborted by shutdown; do not report completion
+			}
+		}
+		if done != nil {
+			done(sent)
+		}
+	}()
+}
+
+// Stop signals the read to abort and waits for the goroutine to finish.
+func (h *historyBacklogSource) Stop() {
+	h.stopOnce.Do(func() { close(h.stopCh) })
+	<-h.doneCh
 }
 
 // updateStartStopButton sets the button label to reflect the current auditing
@@ -2010,6 +2208,8 @@ func onStartStopAuditing() {
 		// Start/Stop cycle still knows the original pre-app state.
 		app.auditEnabledByUs = false
 		setStatus("WFP connection auditing stopped")
+		app.sourceRunning = false
+		updateSourceStatus()
 		dbg("onStartStopAuditing: auditing disabled by user")
 	} else {
 		// Currently off -> turn it on.
@@ -2045,7 +2245,7 @@ func togglePause() {
 	app.paused = !app.paused
 	if app.paused {
 		app.pauseBtn.SetText("Resume")
-		setStatus("PAUSED")
+		setStatus(readingStatus())
 	} else {
 		app.pauseBtn.SetText("Pause")
 		setStatus(readingStatus())
@@ -2071,6 +2271,8 @@ func readingStatus() string {
 	switch {
 	case app.historyMode:
 		return "History mode - showing existing events only, not monitoring"
+	case app.paused:
+		return "PAUSED - collecting events, display frozen (Resume to catch up)"
 	case app.auditingOn:
 		return "Reading Security log (WFP connection auditing on)"
 	default:

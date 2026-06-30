@@ -57,18 +57,15 @@ func newEventSource(out chan *LogEntry) *EventSource {
 func (s *EventSource) Start() { go s.run() }
 
 // RunOnce performs a single backlog poll (no recurring polling) and sends the
-// parsed entries to out, then returns. Used by history mode to ingest existing
-// events without enabling auditing or starting the live poller. It honors the
-// stop channel so a shutdown during ingest is clean.
+// parsed entries to out, then returns. Used by history mode when the PowerShell
+// source is explicitly forced (--powershell); the default history path uses the
+// faster native EvtQuery reader instead. It honors the stop channel so a
+// shutdown during ingest is clean.
 //
 // If done is non-nil it is called once with the number of events actually sent
 // to out, after the send loop finishes (but not if the stop channel aborted the
-// send early — a shutdown should not fire a completion report). The callback
-// runs on RunOnce's goroutine, so it must marshal any UI work itself.
-//
-// Like run(), it closes doneCh on return so a subsequent Stop() (which waits on
-// doneCh) does not block forever. This must be launched as a goroutine exactly
-// once, the same as run().
+// send early). Like run(), it closes doneCh on return so a subsequent Stop()
+// (which waits on doneCh) does not block forever. Launch as a goroutine once.
 func (s *EventSource) RunOnce(done func(count int)) {
 	defer close(s.doneCh)
 	entries := s.poll()
